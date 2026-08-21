@@ -1,0 +1,847 @@
+<?php
+session_start();
+date_default_timezone_set('Asia/Makassar'); // Sesuaikan zona waktu
+
+// ==========================================
+// 1. SETUP DATABASE MYSQL OTOMATIS (VERSI 2)
+// ==========================================
+$host = "localhost";
+$user = "root";
+$pass = "";
+$dbname = "db_mbg_v2"; 
+
+$conn = new mysqli($host, $user, $pass);
+if ($conn->connect_error) die("Koneksi gagal: " . $conn->connect_error);
+
+$conn->query("CREATE DATABASE IF NOT EXISTS $dbname");
+$conn->select_db($dbname);
+
+$conn->query("CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE,
+    password VARCHAR(255),
+    role VARCHAR(20)
+)");
+
+$conn->query("CREATE TABLE IF NOT EXISTS siswa (
+    barcode VARCHAR(100) PRIMARY KEY,
+    nama VARCHAR(150),
+    kelas VARCHAR(50),
+    jurusan VARCHAR(100),
+    wali_kelas VARCHAR(150)
+)");
+
+$conn->query("CREATE TABLE IF NOT EXISTS transaksi (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    barcode VARCHAR(100),
+    jenis VARCHAR(20),
+    waktu DATETIME,
+    petugas VARCHAR(50)
+)");
+
+$cekAdmin = $conn->query("SELECT * FROM users WHERE username='admin'");
+if ($cekAdmin->num_rows == 0) {
+    $pw = password_hash('admin123', PASSWORD_DEFAULT);
+    $conn->query("INSERT INTO users (username, password, role) VALUES ('admin', '$pw', 'ADMIN')");
+    
+    $conn->query("INSERT IGNORE INTO siswa (barcode, nama, kelas, jurusan, wali_kelas) VALUES 
+    ('1001', 'Andi Saputra', 'XII', 'Teknik Komputer Jaringan', 'Bapak Budi Santoso'),
+    ('1002', 'Budi Santoso', 'XI', 'Akuntansi', 'Ibu Siti Rahma'),
+    ('1003', 'Siti Rahma', 'X', 'Teknik Kendaraan Ringan', 'Bapak Junaedi')");
+}
+
+// ==========================================
+// 2. BACKEND API ROUTER
+// ==========================================
+if (isset($_GET['action'])) {
+    header('Content-Type: application/json');
+    $action = $_GET['action'];
+
+    if ($action == 'login') {
+        $data = json_decode(file_get_contents("php://input"));
+        $stmt = $conn->prepare("SELECT * FROM users WHERE username=?");
+        $stmt->bind_param("s", $data->username);
+        $stmt->execute();
+        $user = $stmt->get_result()->fetch_assoc();
+        
+        if ($user && password_verify($data->password, $user['password'])) {
+            $_SESSION['user'] = $user['username'];
+            $_SESSION['role'] = $user['role'];
+            echo json_encode(["status" => "success", "role" => $user['role']]);
+        } else {
+            echo json_encode(["status" => "error", "message" => "Username atau Password salah!"]);
+        }
+        exit;
+    }
+    if ($action == 'logout') {
+        session_destroy();
+        echo json_encode(["status" => "success"]);
+        exit;
+    }
+
+    if (!isset($_SESSION['user'])) {
+        echo json_encode(["status" => "error", "message" => "Unauthorized"]);
+        exit;
+    }
+
+    if ($action == 'get_siswa') {
+        $res = $conn->query("SELECT * FROM siswa ORDER BY kelas ASC, nama ASC");
+        $data = [];
+        while($r = $res->fetch_assoc()) $data[] = $r;
+        echo json_encode($data);
+        exit;
+    }
+
+    if ($action == 'add_siswa') {
+        $data = json_decode(file_get_contents("php://input"));
+        $stmt = $conn->prepare("INSERT INTO siswa (barcode, nama, kelas, jurusan, wali_kelas) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE nama=?, kelas=?, jurusan=?, wali_kelas=?");
+        $stmt->bind_param("sssssssss", $data->barcode, $data->nama, $data->kelas, $data->jurusan, $data->wali_kelas, $data->nama, $data->kelas, $data->jurusan, $data->wali_kelas);
+        if ($stmt->execute()) echo json_encode(["status" => "success", "message" => "Data siswa berhasil disimpan!"]);
+        else echo json_encode(["status" => "error", "message" => "Gagal menyimpan data."]);
+        exit;
+    }
+
+    if ($action == 'delete_siswa') {
+        $data = json_decode(file_get_contents("php://input"));
+        $stmt = $conn->prepare("DELETE FROM siswa WHERE barcode=?");
+        $stmt->bind_param("s", $data->barcode);
+        $stmt->execute();
+        echo json_encode(["status" => "success"]);
+        exit;
+    }
+
+    // API BARU: Hapus Banyak Siswa
+    if ($action == 'delete_bulk_siswa') {
+        $data = json_decode(file_get_contents("php://input"));
+        $barcodes = $data->barcodes;
+        if (!empty($barcodes) && is_array($barcodes)) {
+            $conn->begin_transaction();
+            try {
+                $stmt = $conn->prepare("DELETE FROM siswa WHERE barcode=?");
+                foreach ($barcodes as $bc) {
+                    $stmt->bind_param("s", $bc);
+                    $stmt->execute();
+                }
+                $conn->commit();
+                echo json_encode(["status" => "success", "message" => count($barcodes) . " data siswa berhasil dihapus!"]);
+            } catch (Exception $e) {
+                $conn->rollback();
+                echo json_encode(["status" => "error", "message" => "Gagal menghapus data."]);
+            }
+        } else {
+            echo json_encode(["status" => "error", "message" => "Tidak ada data dipilih."]);
+        }
+        exit;
+    }
+
+    if ($action == 'import_siswa') {
+        $data = json_decode(file_get_contents("php://input"), true);
+        $successCount = 0;
+        $stmt = $conn->prepare("INSERT IGNORE INTO siswa (barcode, nama, kelas, jurusan, wali_kelas) VALUES (?, ?, ?, ?, ?)");
+        
+        foreach ($data as $row) {
+            $b = $row['Barcode'] ?? $row['barcode'] ?? $row['BARCODE'] ?? '';
+            $n = $row['Nama'] ?? $row['nama'] ?? $row['NAMA'] ?? '';
+            $k = $row['Kelas'] ?? $row['kelas'] ?? $row['KELAS'] ?? '';
+            $j = $row['Jurusan'] ?? $row['jurusan'] ?? $row['JURUSAN'] ?? '';
+            $w = $row['Wali Kelas'] ?? $row['wali_kelas'] ?? $row['Wali kelas'] ?? '';
+            
+            if ($b != '' && $n != '') {
+                $stmt->bind_param("sssss", $b, $n, $k, $j, $w);
+                if ($stmt->execute() && $stmt->affected_rows > 0) $successCount++;
+            }
+        }
+        echo json_encode(["status" => "success", "message" => "$successCount data siswa baru berhasil diimpor!"]);
+        exit;
+    }
+
+    if ($action == 'scan') {
+        $data = json_decode(file_get_contents("php://input"));
+        $barcode = $data->barcode;
+        $jenis = $data->jenis;
+        $petugas = $_SESSION['user'];
+        $hari_ini = date('Y-m-d');
+
+        $stmt = $conn->prepare("SELECT * FROM siswa WHERE barcode=?");
+        $stmt->bind_param("s", $barcode);
+        $stmt->execute();
+        $siswa = $stmt->get_result()->fetch_assoc();
+
+        if (!$siswa) {
+            echo json_encode(["status" => "error", "message" => "Siswa tidak ditemukan!"]);
+            exit;
+        }
+
+        $stmtCek = $conn->prepare("SELECT * FROM transaksi WHERE barcode=? AND jenis=? AND DATE(waktu)=?");
+        $stmtCek->bind_param("sss", $barcode, $jenis, $hari_ini);
+        $stmtCek->execute();
+        if ($stmtCek->get_result()->num_rows > 0) {
+            $msg = $jenis == 'MBG' ? "Sudah Mengambil MBG Hari Ini!" : "Sudah Mengembalikan Ompreng Hari Ini!";
+            echo json_encode(["status" => "warning", "message" => $msg, "siswa" => $siswa]);
+            exit;
+        }
+
+        $waktu = date('Y-m-d H:i:s');
+        $stmtInsert = $conn->prepare("INSERT INTO transaksi (barcode, jenis, waktu, petugas) VALUES (?, ?, ?, ?)");
+        $stmtInsert->bind_param("ssss", $barcode, $jenis, $waktu, $petugas);
+        if ($stmtInsert->execute()) {
+            echo json_encode([
+                "status" => "success", 
+                "message" => "Berhasil dicatat!", 
+                "siswa" => $siswa,
+                "jenis" => $jenis,
+                "waktu" => date('H:i:s', strtotime($waktu))
+            ]);
+        } else {
+            echo json_encode(["status" => "error", "message" => "Gagal menyimpan ke database."]);
+        }
+        exit;
+    }
+
+    if ($action == 'dashboard') {
+        $hari_ini = date('Y-m-d');
+        
+        $totalSiswa = $conn->query("SELECT COUNT(*) as tot FROM siswa")->fetch_assoc()['tot'];
+        $mbgHariIni = $conn->query("SELECT COUNT(*) as tot FROM transaksi WHERE jenis='MBG' AND DATE(waktu)='$hari_ini'")->fetch_assoc()['tot'];
+        $belumMBG = $totalSiswa - $mbgHariIni;
+        
+        $qBelumOmpreng = "SELECT COUNT(*) as tot 
+                          FROM transaksi t 
+                          WHERE t.jenis='MBG' AND DATE(t.waktu)='$hari_ini' 
+                          AND t.barcode NOT IN (
+                              SELECT barcode FROM transaksi WHERE jenis='OMPRENG' AND DATE(waktu)='$hari_ini'
+                          )";
+        $belumOmpreng = $conn->query($qBelumOmpreng)->fetch_assoc()['tot'];
+
+        $qListBelumMBG = "SELECT barcode, nama, kelas, jurusan FROM siswa 
+                          WHERE barcode NOT IN (
+                              SELECT barcode FROM transaksi WHERE jenis='MBG' AND DATE(waktu)='$hari_ini'
+                          ) ORDER BY kelas ASC, nama ASC";
+        $resBelum = $conn->query($qListBelumMBG);
+        $listBelumMBG = [];
+        while($r = $resBelum->fetch_assoc()) $listBelumMBG[] = $r;
+
+        echo json_encode([
+            "total_siswa" => $totalSiswa,
+            "sudah_mbg" => $mbgHariIni,
+            "belum_mbg" => $belumMBG,
+            "belum_ompreng" => $belumOmpreng,
+            "list_belum_mbg" => $listBelumMBG
+        ]);
+        exit;
+    }
+    
+    if ($action == 'laporan') {
+        $hari_ini = date('Y-m-d');
+        $query = "SELECT t.waktu, s.barcode, s.nama, s.kelas, s.jurusan, t.petugas 
+                  FROM transaksi t 
+                  JOIN siswa s ON t.barcode = s.barcode 
+                  WHERE t.jenis='MBG' AND DATE(t.waktu)='$hari_ini' 
+                  AND s.barcode NOT IN (
+                      SELECT barcode FROM transaksi WHERE jenis='OMPRENG' AND DATE(waktu)='$hari_ini'
+                  )
+                  ORDER BY t.waktu DESC";
+                  
+        $result = $conn->query($query);
+        $data = [];
+        while($row = $result->fetch_assoc()) $data[] = $row;
+        echo json_encode($data);
+        exit;
+    }
+}
+?>
+
+<!-- ==========================================
+     3. FRONTEND (HTML / CSS / JS)
+     ========================================== -->
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistem MBG & Ompreng (V2)</title>
+    <!-- Bootstrap -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Plugins -->
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <!-- HTML5 QRCode untuk Kamera -->
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    
+    <style>
+        :root { --primary: #4338ca; --bg-color: #f3f4f6; --sidebar-width: 260px; }
+        body { background-color: var(--bg-color); font-family: 'Segoe UI', Tahoma, sans-serif; }
+        
+        #login-page, #app-page { display: none; }
+        #login-page.active, #app-page.active { display: block; }
+        
+        .login-wrapper { height: 100vh; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, var(--primary), #6366f1); }
+        .login-card { background: white; padding: 40px; border-radius: 15px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); width: 100%; max-width: 400px; }
+        
+        .app-container { display: flex; min-height: 100vh; }
+        .sidebar { width: var(--sidebar-width); background: white; border-right: 1px solid #e5e7eb; padding: 20px 0; position: fixed; height: 100vh; z-index: 1000; transition: 0.3s; }
+        .main-content { flex: 1; margin-left: var(--sidebar-width); padding: 20px; transition: 0.3s; }
+        
+        .sidebar-brand { font-size: 1.5rem; font-weight: bold; color: var(--primary); text-align: center; margin-bottom: 30px; }
+        .nav-link { color: #4b5563; padding: 12px 20px; margin: 4px 15px; border-radius: 8px; font-weight: 500; cursor: pointer; transition: 0.2s; }
+        .nav-link:hover, .nav-link.active { background-color: #eef2ff; color: var(--primary); }
+        .nav-link i { width: 25px; }
+
+        .topbar { background: white; padding: 15px 25px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; }
+        
+        .page-content { display: none; }
+        .page-content.active { display: block; animation: fadeIn 0.4s; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        .stat-card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); border-left: 5px solid var(--primary); }
+        
+        .scanner-box { background: white; padding: 25px; border-radius: 12px; text-align: center; }
+        .result-box { margin-top: 20px; padding: 20px; border-radius: 10px; display: none; }
+        .result-box.success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+        .result-box.warning { background: #fef08a; color: #854d0e; border: 1px solid #fde047; }
+        
+        .sidebar-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999; }
+        .mobile-toggle { display: none; background: none; border: none; font-size: 1.5rem; color: var(--primary); }
+
+        /* Styling Scanner Kamera */
+        #reader { width: 100%; max-width: 500px; margin: 0 auto 20px auto; border-radius: 12px; overflow: hidden; border: none !important; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); background: #f8fafc; }
+        #reader button { background-color: var(--primary); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 500; }
+        #reader button:hover { background-color: #3730a3; }
+        
+        @media (max-width: 768px) {
+            .sidebar { transform: translateX(-100%); }
+            .sidebar.show { transform: translateX(0); }
+            .main-content { margin-left: 0; padding: 15px; }
+            .mobile-toggle { display: block; }
+            .sidebar-overlay.show { display: block; }
+            .table-responsive { white-space: nowrap; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ================= LOGIN PAGE ================= -->
+    <div id="login-page" class="login-wrapper <?php echo !isset($_SESSION['user']) ? 'active' : ''; ?>">
+        <div class="login-card">
+            <div class="text-center mb-4">
+                <i class="fas fa-utensils fa-3x" style="color: var(--primary);"></i>
+                <h3 class="mt-3 font-weight-bold">Sistem MBG</h3>
+            </div>
+            <form id="form-login" onsubmit="doLogin(event)">
+                <div class="mb-3">
+                    <input type="text" id="username" class="form-control" required placeholder="Username (admin)">
+                </div>
+                <div class="mb-4">
+                    <input type="password" id="password" class="form-control" required placeholder="Password (admin123)">
+                </div>
+                <button type="submit" class="btn btn-primary w-100 py-2"><i class="fas fa-sign-in-alt me-2"></i> MASUK</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ================= APP PAGE ================= -->
+    <div id="app-page" class="<?php echo isset($_SESSION['user']) ? 'active' : ''; ?>">
+        <div class="app-container">
+            <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
+
+            <div class="sidebar" id="sidebar">
+                <div class="sidebar-brand"><i class="fas fa-utensils me-2"></i> MBG System</div>
+                <div class="nav-link active" onclick="nav('dashboard')"><i class="fas fa-chart-pie"></i> Dashboard</div>
+                <div class="nav-link" onclick="nav('siswa')"><i class="fas fa-users"></i> Data Siswa</div>
+                <div class="nav-link" onclick="nav('scanner')"><i class="fas fa-camera"></i> Scan Kamera</div>
+                <div class="nav-link" onclick="nav('laporan')"><i class="fas fa-file-alt"></i> Laporan MBG</div>
+            </div>
+
+            <div class="main-content">
+                <div class="topbar">
+                    <button class="mobile-toggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
+                    <div class="fw-bold d-none d-md-block">Aplikasi Pengambilan MBG</div>
+                    <div class="d-flex align-items-center">
+                        <div class="me-3 text-end d-none d-sm-block">
+                            <div class="fw-bold" style="font-size:0.9rem;" id="user-display"><?= $_SESSION['user'] ?? 'Petugas' ?></div>
+                            <div class="text-muted" style="font-size:0.75rem;"><span id="clock">00:00:00</span></div>
+                        </div>
+                        <button class="btn btn-outline-danger btn-sm" onclick="doLogout()"><i class="fas fa-power-off"></i></button>
+                    </div>
+                </div>
+
+                <!-- DASHBOARD -->
+                <div id="page-dashboard" class="page-content active">
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <h4 class="mb-0 text-dark fw-bold">Dashboard Hari Ini</h4>
+                        <button class="btn btn-primary btn-sm" onclick="loadDashboard()"><i class="fas fa-sync-alt"></i></button>
+                    </div>
+                    
+                    <div class="row g-3">
+                        <div class="col-md-3 col-6"><div class="stat-card" style="border-color: #3b82f6;"><h6>TOTAL SISWA</h6><h3 id="dash-total">0</h3></div></div>
+                        <div class="col-md-3 col-6"><div class="stat-card" style="border-color: #10b981;"><h6>SUDAH MBG</h6><h3 id="dash-mbg">0</h3></div></div>
+                        <div class="col-md-3 col-6"><div class="stat-card" style="border-color: #ef4444;"><h6>BELUM MBG</h6><h3 id="dash-belum">0</h3></div></div>
+                        <div class="col-md-3 col-6"><div class="stat-card" style="border-color: #8b5cf6;"><h6>BELUM KEMBALI OMPRENG</h6><h3 id="dash-ompreng">0</h3></div></div>
+                    </div>
+
+                    <div class="mt-4 pt-2">
+                        <h5 class="fw-bold text-dark mb-3"><i class="fas fa-list text-danger me-2"></i>Daftar Siswa Belum Mengambil MBG</h5>
+                        <div class="card border-0 shadow-sm table-responsive" style="max-height: 400px; overflow-y: auto;">
+                            <table class="table table-hover mb-0">
+                                <thead class="table-danger" style="position: sticky; top: 0; z-index: 1;">
+                                    <tr>
+                                        <th>Barcode</th>
+                                        <th>Nama Siswa</th>
+                                        <th>Kelas (Jurusan)</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tbody-dash-belum"><tr><td colspan="3" class="text-center">Memuat...</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- DATA SISWA -->
+                <div id="page-siswa" class="page-content">
+                    <div class="d-flex flex-wrap justify-content-between align-items-center mb-4">
+                        <h4 class="mb-0 text-dark fw-bold mb-2">Manajemen Data Siswa</h4>
+                        <div class="d-flex gap-2 mb-2">
+                            <!-- Tombol Baru: Hapus Terpilih -->
+                            <button class="btn btn-danger btn-sm" onclick="hapusSiswaTerpilih()"><i class="fas fa-trash-alt me-1"></i> Hapus Terpilih</button>
+                            <button class="btn btn-success btn-sm" onclick="triggerImportExcel()"><i class="fas fa-file-excel me-1"></i> Import</button>
+                            <button class="btn btn-warning btn-sm text-dark" onclick="exportDataExcel()"><i class="fas fa-download me-1"></i> Export</button>
+                            <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#modalSiswa" onclick="resetFormSiswa()"><i class="fas fa-plus me-1"></i> Tambah</button>
+                        </div>
+                    </div>
+                    
+                    <input type="file" id="fileExcel" style="display:none" accept=".xlsx, .xls" onchange="prosesImportExcel(event)">
+
+                    <div class="card border-0 shadow-sm">
+                        <div class="card-body p-0 table-responsive">
+                            <table class="table table-hover mb-0">
+                                <thead class="table-light">
+                                    <tr>
+                                        <!-- Checkbox Pilih Semua -->
+                                        <th style="width: 40px; text-align: center;">
+                                            <input type="checkbox" id="checkAllSiswa" class="form-check-input" onclick="toggleCheckAllSiswa()">
+                                        </th>
+                                        <th>Barcode</th>
+                                        <th>Nama Siswa</th>
+                                        <th>Kelas</th>
+                                        <th>Jurusan</th>
+                                        <th>Wali Kelas</th>
+                                        <th class="text-center">Aksi</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tbody-siswa"><tr><td colspan="7" class="text-center">Memuat...</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SCANNER KAMERA -->
+                <div id="page-scanner" class="page-content">
+                    <div class="row justify-content-center">
+                        <div class="col-md-8">
+                            <div class="scanner-box">
+                                <h4 class="mb-4 fw-bold">Pencatatan Transaksi</h4>
+                                
+                                <div class="btn-group w-100 mb-4">
+                                    <input type="radio" class="btn-check" name="jenisTrans" id="btnMBG" value="MBG" checked autocomplete="off">
+                                    <label class="btn btn-outline-primary py-2 fw-bold" for="btnMBG"><i class="fas fa-utensils me-2"></i>AMBIL MBG</label>
+                                  
+                                    <input type="radio" class="btn-check" name="jenisTrans" id="btnOmpreng" value="OMPRENG" autocomplete="off">
+                                    <label class="btn btn-outline-primary py-2 fw-bold" for="btnOmpreng"><i class="fas fa-box me-2"></i>KEMBALI OMPRENG</label>
+                                </div>
+
+                                <!-- Box Kamera HTML5 QRCode -->
+                                <div id="reader"></div>
+
+                                <!-- Hasil Scan -->
+                                <div id="scan-result" class="result-box mt-4">
+                                    <i id="res-icon" class="fas fa-check-circle fa-3x mb-2"></i>
+                                    <h4 id="res-msg" class="fw-bold">Berhasil</h4>
+                                    <hr>
+                                    <h5 id="res-nama" class="mb-1">-</h5>
+                                    <p class="mb-0 text-muted" id="res-kelas">-</p>
+                                    <small class="fw-bold mt-2 d-block" id="res-waktu"></small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- LAPORAN HANYA MBG -->
+                <div id="page-laporan" class="page-content">
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <h4 class="mb-0 text-dark fw-bold">Laporan Siswa Belum Kembali Ompreng</h4>
+                        <button class="btn btn-primary btn-sm" onclick="loadLaporan()"><i class="fas fa-sync-alt"></i> Refresh</button>
+                    </div>
+                    
+                    <div class="alert alert-info py-2" role="alert">
+                        <i class="fas fa-info-circle me-2"></i> Siswa yang tampil di sini adalah siswa yang <strong>sudah ambil MBG</strong> tetapi <strong>belum kembali Ompreng</strong>. Jika siswa scan "Kembali Ompreng", namanya akan otomatis terhapus dari daftar ini.
+                    </div>
+
+                    <div class="card border-0 shadow-sm table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead class="table-primary">
+                                <tr>
+                                    <th>Waktu (Ambil MBG)</th>
+                                    <th>Barcode</th>
+                                    <th>Nama Siswa</th>
+                                    <th>Kelas (Jurusan)</th>
+                                    <th>Petugas</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody-mbg">
+                                <tr><td colspan="5" class="text-center">Memuat...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Tambah/Edit Siswa -->
+    <div class="modal fade" id="modalSiswa" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title fw-bold">Form Data Siswa</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="form-siswa" onsubmit="simpanSiswa(event)">
+                        <div class="mb-3">
+                            <label class="form-label">Barcode / NIS</label>
+                            <input type="text" id="s_barcode" class="form-control" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Nama Lengkap</label>
+                            <input type="text" id="s_nama" class="form-control" required>
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col"><label class="form-label">Kelas</label><input type="text" id="s_kelas" class="form-control" placeholder="Contoh: XII"></div>
+                            <div class="col"><label class="form-label">Jurusan</label><input type="text" id="s_jurusan" class="form-control" placeholder="Contoh: TKJ"></div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Wali Kelas</label>
+                            <input type="text" id="s_wali" class="form-control">
+                        </div>
+                        <button type="submit" class="btn btn-primary w-100">SIMPAN DATA</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+    <!-- ================= JAVASCRIPT LOGIC ================= -->
+    <script>
+        setInterval(() => document.getElementById('clock').innerText = new Date().toLocaleTimeString('id-ID'), 1000);
+
+        // VARIABEL SCANNER KAMERA
+        let html5QrcodeScanner = null;
+
+        function nav(page) {
+            document.querySelectorAll('.page-content, .nav-link').forEach(el => el.classList.remove('active'));
+            document.getElementById('page-' + page).classList.add('active');
+            event.currentTarget.classList.add('active');
+            if(window.innerWidth <= 768) toggleSidebar(); 
+
+            // Matikan Kamera Jika pindah menu
+            if(page !== 'scanner') {
+                hentikanKamera();
+            }
+
+            if(page === 'dashboard') loadDashboard();
+            if(page === 'laporan') loadLaporan(); 
+            if(page === 'siswa') loadSiswa();
+            if(page === 'scanner') {
+                nyalakanKamera();
+            }
+        }
+
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('show');
+            document.getElementById('sidebar-overlay').classList.toggle('show');
+        }
+
+        async function api(action, data = null) {
+            const opt = { method: data ? 'POST' : 'GET', headers: { 'Content-Type': 'application/json' } };
+            if(data) opt.body = JSON.stringify(data);
+            const res = await fetch('index.php?action=' + action, opt);
+            return await res.json();
+        }
+
+        async function doLogin(e) {
+            e.preventDefault();
+            const res = await api('login', {
+                username: document.getElementById('username').value,
+                password: document.getElementById('password').value
+            });
+            if(res.status === 'success') { location.reload(); } 
+            else { Swal.fire('Error', res.message, 'error'); }
+        }
+        async function doLogout() { await api('logout'); location.reload(); }
+
+        // --- MANAJEMEN KAMERA ---
+        function nyalakanKamera() {
+            if(!html5QrcodeScanner) {
+                html5QrcodeScanner = new Html5QrcodeScanner(
+                    "reader", { fps: 10, qrbox: {width: 250, height: 250}, rememberLastUsedCamera: true }, false
+                );
+                html5QrcodeScanner.render(onScanSuccess, onScanFailure);
+            }
+        }
+
+        function hentikanKamera() {
+            if (html5QrcodeScanner) {
+                html5QrcodeScanner.clear().catch(error => { console.error("Gagal mematikan kamera.", error); });
+                html5QrcodeScanner = null;
+            }
+        }
+
+        // BEEP SOUND GENERATOR
+        function playBeep(type) {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                if (type === 'success') {
+                    osc.frequency.value = 1200; // Nada tinggi
+                    osc.type = 'sine';
+                    gain.gain.setValueAtTime(0.1, ctx.currentTime);
+                    osc.start(); osc.stop(ctx.currentTime + 0.15); // Pendek
+                } else {
+                    osc.frequency.value = 300; // Nada rendah
+                    osc.type = 'square';
+                    gain.gain.setValueAtTime(0.1, ctx.currentTime);
+                    osc.start(); osc.stop(ctx.currentTime + 0.4); // Panjang
+                }
+            } catch(e) {}
+        }
+
+        async function onScanSuccess(decodedText, decodedResult) {
+            // Mencegah scan berulang yang terlalu cepat (Debounce)
+            if(html5QrcodeScanner.getState() === 2) { // 2 = SCANNING
+                html5QrcodeScanner.pause();
+                
+                await jalankanProsesScan(decodedText);
+
+                // Resume kamera setelah 2 detik agar siap scan murid berikutnya
+                setTimeout(() => {
+                    if(html5QrcodeScanner && html5QrcodeScanner.getState() === 3) { // 3 = PAUSED
+                        html5QrcodeScanner.resume();
+                    }
+                }, 2000);
+            }
+        }
+
+        function onScanFailure(error) {
+            // Abaikan error saat tidak ada QR di frame kamera
+        }
+
+        // PROSES UTAMA PENYIMPANAN KE DATABASE
+        async function jalankanProsesScan(bc) {
+            const jenis = document.querySelector('input[name="jenisTrans"]:checked').value;
+            
+            const res = await api('scan', {barcode: bc, jenis: jenis});
+            const resBox = document.getElementById('scan-result');
+            resBox.style.display = 'block';
+            
+            if(res.status === 'success') {
+                playBeep('success');
+                resBox.className = 'result-box success';
+                document.getElementById('res-icon').className = 'fas fa-check-circle fa-3x mb-2';
+                document.getElementById('res-msg').innerText = 'BERHASIL - ' + res.jenis;
+                document.getElementById('res-nama').innerText = res.siswa.nama;
+                document.getElementById('res-kelas').innerText = res.siswa.kelas + ' - ' + res.siswa.jurusan;
+                document.getElementById('res-waktu').innerText = res.waktu;
+            } else if(res.status === 'warning') {
+                playBeep('error');
+                resBox.className = 'result-box warning';
+                document.getElementById('res-icon').className = 'fas fa-exclamation-triangle fa-3x mb-2';
+                document.getElementById('res-msg').innerText = res.message;
+                document.getElementById('res-nama').innerText = res.siswa.nama;
+                document.getElementById('res-kelas').innerText = res.siswa.kelas + ' - ' + res.siswa.jurusan;
+                document.getElementById('res-waktu').innerText = '';
+            } else {
+                playBeep('error');
+                Swal.fire('Gagal', res.message, 'error');
+                resBox.style.display = 'none';
+            }
+        }
+
+        // --- DASHBOARD ---
+        async function loadDashboard() {
+            const res = await api('dashboard');
+            document.getElementById('dash-total').innerText = res.total_siswa;
+            document.getElementById('dash-mbg').innerText = res.sudah_mbg;
+            document.getElementById('dash-belum').innerText = res.belum_mbg;
+            document.getElementById('dash-ompreng').innerText = res.belum_ompreng;
+
+            let html = '';
+            if (res.list_belum_mbg.length === 0) {
+                html = '<tr><td colspan="3" class="text-center text-muted py-4"><i class="fas fa-check-circle fa-2x text-success mb-2 d-block"></i> Semua siswa sudah mengambil MBG!</td></tr>';
+            } else {
+                res.list_belum_mbg.forEach(s => {
+                    html += `<tr>
+                        <td class="fw-bold">${s.barcode}</td>
+                        <td>${s.nama}</td>
+                        <td>${s.kelas} (${s.jurusan})</td>
+                    </tr>`;
+                });
+            }
+            document.getElementById('tbody-dash-belum').innerHTML = html;
+        }
+
+        // --- DATA SISWA CRUD & HAPUS MASSAL ---
+        let currentDataSiswa = [];
+        async function loadSiswa() {
+            document.getElementById('tbody-siswa').innerHTML = '<tr><td colspan="7" class="text-center">Memuat...</td></tr>';
+            currentDataSiswa = await api('get_siswa');
+            
+            let html = '';
+            if(currentDataSiswa.length === 0) {
+                html = '<tr><td colspan="7" class="text-center text-muted">Belum ada data siswa</td></tr>';
+            } else {
+                currentDataSiswa.forEach(s => {
+                    html += `<tr>
+                        <td class="text-center">
+                            <input type="checkbox" class="form-check-input check-siswa" value="${s.barcode}">
+                        </td>
+                        <td class="fw-bold">${s.barcode}</td>
+                        <td>${s.nama}</td>
+                        <td>${s.kelas}</td>
+                        <td>${s.jurusan}</td>
+                        <td>${s.wali_kelas}</td>
+                        <td class="text-center">
+                            <button class="btn btn-sm btn-danger py-0 px-2" onclick="hapusSiswa('${s.barcode}')"><i class="fas fa-trash"></i></button>
+                        </td>
+                    </tr>`;
+                });
+            }
+            document.getElementById('tbody-siswa').innerHTML = html;
+            document.getElementById('checkAllSiswa').checked = false; // Reset checkbox pilih semua
+        }
+
+        // Fungsi Centang Semua
+        function toggleCheckAllSiswa() {
+            const isChecked = document.getElementById('checkAllSiswa').checked;
+            const checkboxes = document.querySelectorAll('.check-siswa');
+            checkboxes.forEach(cb => cb.checked = isChecked);
+        }
+
+        // Fungsi Hapus Terpilih
+        async function hapusSiswaTerpilih() {
+            const checkboxes = document.querySelectorAll('.check-siswa:checked');
+            if (checkboxes.length === 0) {
+                return Swal.fire('Oops', 'Pilih minimal satu data siswa untuk dihapus.', 'warning');
+            }
+
+            // Ambil semua barcode yang dicentang
+            const barcodes = Array.from(checkboxes).map(cb => cb.value);
+            
+            if(confirm(`Yakin ingin menghapus ${barcodes.length} data siswa terpilih secara permanen?`)) {
+                const res = await api('delete_bulk_siswa', {barcodes: barcodes});
+                if(res.status === 'success') {
+                    Swal.fire('Info', res.message, 'success');
+                    loadSiswa();
+                } else {
+                    Swal.fire('Error', res.message, 'error');
+                }
+            }
+        }
+
+        function resetFormSiswa() { document.getElementById('form-siswa').reset(); }
+
+        async function simpanSiswa(e) {
+            e.preventDefault();
+            const data = {
+                barcode: document.getElementById('s_barcode').value,
+                nama: document.getElementById('s_nama').value,
+                kelas: document.getElementById('s_kelas').value,
+                jurusan: document.getElementById('s_jurusan').value,
+                wali_kelas: document.getElementById('s_wali').value,
+            };
+            const res = await api('add_siswa', data);
+            bootstrap.Modal.getInstance(document.getElementById('modalSiswa')).hide();
+            Swal.fire('Info', res.message, res.status);
+            loadSiswa();
+        }
+
+        async function hapusSiswa(barcode) {
+            if(confirm('Yakin ingin menghapus siswa dengan barcode: ' + barcode + '?')) {
+                await api('delete_siswa', {barcode: barcode});
+                loadSiswa();
+            }
+        }
+
+        function triggerImportExcel() { document.getElementById('fileExcel').click(); }
+        
+        function prosesImportExcel(e) {
+            const file = e.target.files[0];
+            if(!file) return;
+            Swal.fire({title: 'Memproses Excel...', allowOutsideClick: false, didOpen: () => Swal.showLoading()});
+            
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                try {
+                    const data = new Uint8Array(e.target.result);
+                    const workbook = XLSX.read(data, {type: 'array'});
+                    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                    const jsonData = XLSX.utils.sheet_to_json(sheet);
+                    
+                    if(jsonData.length === 0) return Swal.fire('Error', 'File excel kosong atau format salah.', 'error');
+                    const res = await api('import_siswa', jsonData);
+                    Swal.fire('Info', res.message, res.status);
+                    loadSiswa();
+                } catch (error) { Swal.fire('Error', 'Gagal membaca file Excel.', 'error'); }
+            };
+            reader.readAsArrayBuffer(file);
+            document.getElementById('fileExcel').value = ''; 
+        }
+
+        function exportDataExcel() {
+            if(currentDataSiswa.length === 0) return Swal.fire('Oops', 'Data siswa masih kosong!', 'warning');
+            const dataExport = currentDataSiswa.map(s => ({
+                "Barcode": s.barcode, "Nama": s.nama, "Kelas": s.kelas, "Jurusan": s.jurusan, "Wali Kelas": s.wali_kelas
+            }));
+            const ws = XLSX.utils.json_to_sheet(dataExport);
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "DataSiswa");
+            XLSX.writeFile(wb, "Data_Siswa_MBG.xlsx");
+        }
+
+        // --- LAPORAN ---
+        async function loadLaporan() {
+            document.getElementById('tbody-mbg').innerHTML = '<tr><td colspan="5" class="text-center">Memuat...</td></tr>';
+            
+            const data = await api('laporan');
+            let html = '';
+            if(data.length === 0) { 
+                html = '<tr><td colspan="5" class="text-center text-muted">Semua siswa sudah mengembalikan ompreng (Kosong)</td></tr>'; 
+            } else {
+                data.forEach(row => {
+                    const time = row.waktu.split(' ')[1];
+                    html += `<tr>
+                        <td class="fw-bold">${time}</td>
+                        <td>${row.barcode}</td>
+                        <td>${row.nama}</td>
+                        <td>${row.kelas} (${row.jurusan})</td>
+                        <td>${row.petugas}</td>
+                    </tr>`;
+                });
+            }
+            document.getElementById('tbody-mbg').innerHTML = html;
+        }
+
+        // INITIAL LOAD
+        if(document.getElementById('app-page').classList.contains('active')) {
+            loadDashboard();
+        }
+    </script>
+</body>
+</html>
